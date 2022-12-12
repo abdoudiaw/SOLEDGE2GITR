@@ -1,3 +1,13 @@
+# Copyright 2022, SOLEDGE contributors
+# Authors: Nick Lubbers(LANL), Abdou Diaw (ORNL)
+# License: 3-Clause-BSD-LBNL
+"""
+This file is part SOLEDGE-GITR.
+It uses an ensemble of NN to train and test dataset from DB.
+"""
+# -------
+# Imports
+# -------
 import copy
 import warnings
 
@@ -12,19 +22,21 @@ import sklearn.metrics
 # Built with sklearn 0.20.1
 
 import sqlite3
-
+from enum import Enum, IntEnum
+import collections
 
 torch.set_default_dtype(torch.float64)
 
-#from alInterface import getAllGNDData
-from glueCodeTypes import SolverCode, BGKInputs, BGKOutputs
+# Define inputs/ouputs of the problem
 
-def getAllGNDData(dbPath, solverCode):
+Inputs = collections.namedtuple('Inputs', 'R Z')
+Outputs = collections.namedtuple('Outputs', 'BPHI BR BZ TE NE VE TI NI VI')
+
+
+def getAllGNDData(dbPath):
     selString = ""
-    if solverCode == SolverCode.BGK:
-        selString = "SELECT * FROM SOLEDGE;"
-    else:
-        raise Exception('Using Unsupported Solver Code')
+
+    selString = "SELECT * FROM SOLEDGE;"
     sqlDB = sqlite3.connect(dbPath, timeout=45.0)
     sqlCursor = sqlDB.cursor()
     gndResults = []
@@ -39,14 +51,13 @@ class Model():
     """
     Ensemble model. Error bar is std. dev. of networks.
     """
-    def __init__(self,solver,networks,err_info=None):
+    def __init__(self,networks,err_info=None):
         self.networks = networks
         self.err_info = err_info
-        self.solver = solver
 
     def __call__(self,request_params):
         """
-        :param request_params: BGKInputs
+        :param request_params: Inputs
         :return: result[3], errbar[3]
         """
         request_params = self.pack_inputs(request_params)
@@ -63,7 +74,7 @@ class Model():
 
         request_params = torch.as_tensor(request_params)
         if perform_column_extraction:
-            request_params = request_params[...,SOLVER_INDEXES[self.solver]["input_slice"]]
+            request_params = request_params[...,SOLVER_INDEXES["input_slice"]]
 
         if not batched:
             request_params = request_params.unsqueeze(0)
@@ -87,18 +98,13 @@ class Model():
 
         calibration = np.mean(abserr,axis=0)/np.mean(uncertainty,axis=0)
 
-        # Factor 3 is somewhat arbitrary... larger -> less fussy model.
-        # Roughly corresponds to a number of standard deviations
         calibration /= 3
-
         self.err_info /= calibration
 
         inactive_columns = (np.std(abserr,axis=0)==0) & (np.std(uncertainty,axis=0)==0)
 
         warnings.warn("Inactive columns detected: {} , they will not be included in isokay.".format(np.where(inactive_columns)))
         self.err_info[inactive_columns]=np.inf
-
-
 
 
     def process_iserrok_fuzzy(self,errbars):
@@ -129,59 +135,27 @@ class Model():
         return NotImplemented
 
 
-
-
-class BGKModel(Model):
+class LearnerModel(Model):
     def pack_inputs(self,request):
-
         packed_request = np.concatenate([[request.R],[request.Z]])
-        
         return packed_request
 
     def unpack_outputs(self,packed_result):
-
-        # OLD: #HARDCODING FOR 3 DIFFUSION TERM PROBLEM
-        # diff_array = np.zeros(10)
-        # #print(packed_result,packed_result.shape)
-        # diff_array[-3:] = packed_result
-
-        # All things predicted
-#        v00 = packed_result[0]
-#        v01 = packed_result[1]
-#        v11 = packed_result[2]
-#        unpacked_result = BGKOutputs(packed_result[0])
-        unpacked_result = BGKOutputs(packed_result[0],packed_result[1], packed_result[2], packed_result[3],packed_result[4],packed_result[5],packed_result[6],packed_result[7],packed_result[8])
-
-        #Full version of problem should look like this:
-        # unpacked_result = BGKOutputs(packed_result[0],packed_result[1],packed_result[2:])
+        unpacked_result = Outputs(packed_result[0],packed_result[1], packed_result[2], packed_result[3],packed_result[4],packed_result[5],packed_result[6],packed_result[7],packed_result[8])
         return unpacked_result
 
     def pack_outputs(self,outputs):
-        # OLD: #HARDCODING FOR 3 DIFFUSION TERM PROBLEM.
-        # output_vals = outputs.DiffCoeff[-3:]
-
-
-        # Full_version of problem should look like this:
         output_vals = np.concatenate([[outputs.BPHI], [outputs.BR], [outputs.BZ], [outputs.TE], [outputs.NE], [outputs.VE],
          [outputs.TI], [outputs.NI], [outputs.VI]])
-#        print('output_vals',output_vals)
         return output_vals,
 
-
 # Parameters governing input and outputs to problem
-
-SOLVER_INDEXES = {
-    #HARDCODED TO 3 DIFFUSION TERM PROBLEM
-    SolverCode.BGK:dict(
-                        input_slice=slice(0,2),    # For full version: slice(0,9),
-                        output_slice=slice(2,11), # For full version? slice(10,22)?
-                        n_inputs = 2,              # For full version: 9
-                        n_outputs = 9,            # For full version: 12?
-                        model_type = BGKModel,     #
-                    )
-    #Other solver codes...
-}
-
+SOLVER_INDEXES = dict(
+        input_slice = slice(0,2),
+        output_slice = slice(2,11),
+        n_inputs = 2,
+        n_outputs = 9,
+)
 
 #Parameters governing network structure
 DEFAULT_NET_CONFIG = dict(
@@ -217,16 +191,15 @@ DEFAULT_TRAINING_CONFIG = dict(
 DEFAULT_LEARNING_CONFIG = dict(
     net_config = DEFAULT_NET_CONFIG,
     ensemble_config = DEFAULT_ENSEMBLE_CONFIG,
-    solver_type = SolverCode.BGK,
     training_config = DEFAULT_TRAINING_CONFIG,
 )
 
-def assemble_dataset(raw_dataset,solver_code):
+def assemble_dataset(raw_dataset):
 
-    features = torch.as_tensor(raw_dataset[:,SOLVER_INDEXES[solver_code]["input_slice"]])
+    features = torch.as_tensor(raw_dataset[:,SOLVER_INDEXES["input_slice"]])
 #    print("Feature shape:",features.shape)
 #    print(features.std(axis=0))
-    targets = torch.as_tensor(raw_dataset[:,SOLVER_INDEXES[solver_code]["output_slice"]])
+    targets = torch.as_tensor(raw_dataset[:,SOLVER_INDEXES["output_slice"]])
 #    print("Targets shape:",targets.shape)
 #    print(targets.std(axis=0))
     return torch.utils.data.TensorDataset(features,targets)
@@ -234,9 +207,8 @@ def assemble_dataset(raw_dataset,solver_code):
 #prototype, only covers ensemble uncertainties
 def retrain(db_path,learning_config=DEFAULT_LEARNING_CONFIG):
 
-    solver = learning_config["solver_type"]
-    raw_dataset = getAllGNDData(db_path,solver)
-    full_dataset = assemble_dataset(raw_dataset,solver)
+    raw_dataset = getAllGNDData(db_path)
+    full_dataset = assemble_dataset(raw_dataset)
 
 
     ensemble_config = learning_config["ensemble_config"]
@@ -280,10 +252,8 @@ def retrain(db_path,learning_config=DEFAULT_LEARNING_CONFIG):
         network_scores.append(model_score)
         network_errors.append(model_errors)
 
-    #print("scores",network_scores)
     error_info = np.mean(np.asarray(network_errors),axis=0)
-
-    full_model = SOLVER_INDEXES[solver]["model_type"](solver, networks, error_info)
+    full_model = SOLVER_INDEXES["model_type"]( networks, error_info)
     full_model.calibrate(full_dataset)
 
     return full_model
@@ -318,8 +288,7 @@ def train_single_model(train_data, learning_config):
     outscaler = Scaler.from_inversion((cost_scaler))
 
     #Size parameters
-    solver = learning_config["solver_type"]
-    indices = SOLVER_INDEXES[solver]
+    indices = SOLVER_INDEXES
 
     n_inputs = indices["n_inputs"]
     n_outputs = indices["n_outputs"]
@@ -365,9 +334,6 @@ def train_single_model(train_data, learning_config):
             break
     else:
         print("Training finished due to max epoch",i)
-
-
-
 
 
     train_network.load_state_dict(best_params)
@@ -435,17 +401,14 @@ def get_score(predicted,true):
         rmse = np.sqrt(sklearn.metrics.mean_squared_error(t,p))
 
         if p.std() < 1e-300 and t.std() < 1e-300:
-            #print("divide by zero error for column",i)
             rsq = 1.
             l1resid = 1.
         else:
             rsq = sklearn.metrics.r2_score(t,p)
             l1resid = l1_score(t,p)
 
-        #HARDCODED: SCORE FOR EACH THING TO PREDICT IS RSQ
         score.append(rsq)
         rmse_list.append(rmse)
-        #print(i,rsq,l1resid)
 
     #HARDCODED: TOTAL SCORE IS PRODUCT OF SCORES FOR EACH TARGET
     score = np.asarray(score)

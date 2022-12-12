@@ -1,9 +1,9 @@
 import torch
-import nn_learner
+import nn
 
-DB_PATH='data.db'
+DB_PATH='SOLEDGE.db'
 
-model =nn_learner.retrain(db_path=DB_PATH)
+model =nn.retrain(db_path=DB_PATH)
 
 #Ensure model can be pickled and unpickled.
 torch.save(model,"data.pt")
